@@ -7,7 +7,7 @@ import json
 import pathlib
 
 IMAGE = "{{TRIBUNAL_IMAGE}}"
-SOURCE = "https://github.com/Metta-AI/cogame-tribunal/tree/main"
+SOURCE = "https://github.com/softmax-universe/cogame-tribunal/tree/main"
 SEATS = 5
 
 DESCRIPTION = (
