@@ -66,7 +66,13 @@ network="${prefix}-net"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/${slug}-smoke.XXXXXX")"
 seats=0
 
+fixture_pid=""
+fixture_log=""
 cleanup() {
+  if [ -n "${fixture_pid}" ]; then
+    kill "${fixture_pid}" >/dev/null 2>&1 || true
+    wait "${fixture_pid}" >/dev/null 2>&1 || true
+  fi
   docker ps -aq --filter "name=${prefix}" | xargs -r docker rm -f >/dev/null 2>&1 || true
   docker network rm "${network}" >/dev/null 2>&1 || true
   rm -rf "${work_dir}"
@@ -191,16 +197,40 @@ chmod 777 "${work_dir}"
 docker network create "${network}" >/dev/null
 
 game_env=()
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+if [ -n "${COWORLD_LLM_ENDPOINT:-}" ]; then
+  game_env+=(-e "COWORLD_LLM_ENDPOINT=${COWORLD_LLM_ENDPOINT}")
+  if [ -n "${COWORLD_LLM_MODEL:-}" ]; then
+    game_env+=(-e "COWORLD_LLM_MODEL=${COWORLD_LLM_MODEL}")
+  fi
+  echo "COWORLD_LLM_ENDPOINT present: using ${COWORLD_LLM_ENDPOINT}"
+elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   game_env+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
   echo "ANTHROPIC_API_KEY present: the LLM path will be exercised"
 else
-  echo "no ANTHROPIC_API_KEY: the game must complete on its scripted baselines"
+  fixture_port_file="${work_dir}/fixture.port"
+  fixture_log="${work_dir}/fixture_calls.jsonl"
+  python3 "${script_dir}/llm_fixture.py" \
+    --host 0.0.0.0 --port 0 \
+    --port-file "${fixture_port_file}" \
+    --log-file "${fixture_log}" &
+  fixture_pid=$!
+  for _ in $(seq 1 50); do
+    if [ -s "${fixture_port_file}" ]; then
+      break
+    fi
+    sleep 0.1
+  done
+  test -s "${fixture_port_file}" || { echo "FAIL: llm_fixture did not start" >&2; exit 1; }
+  fixture_port="$(cat "${fixture_port_file}")"
+  game_env+=(-e "COWORLD_LLM_ENDPOINT=http://host.docker.internal:${fixture_port}")
+  game_env+=(-e "COWORLD_LLM_MODEL=anthropic/claude-haiku-4.5")
+  echo "started local HTTP LLM fixture on port ${fixture_port}"
 fi
 
 echo "starting game container (${image} ${game_bin}) ..."
 docker run -d --name "${prefix}-game" \
   --network "${network}" --network-alias "${prefix}-game" \
+  --add-host=host.docker.internal:host-gateway \
   -e COGAME_HOST=0.0.0.0 \
   -e COGAME_PORT="${port}" \
   -e COGAME_CONFIG_URI=file:///coworld/config.json \
@@ -299,6 +329,34 @@ PY
 then
   dump_logs
   exit 1
+fi
+
+if [ -n "${fixture_log}" ]; then
+  python3 - "${fixture_log}" "${manifest}" <<'PY'
+import json, sys
+from pathlib import Path
+
+log_path, manifest_path = Path(sys.argv[1]), Path(sys.argv[2])
+manifest = json.loads(manifest_path.read_text())
+by_id = {p["id"]: p for p in manifest.get("player") or []}
+model_slots = {
+    slot
+    for slot, entry in enumerate(manifest["certification"]["players"])
+    if (by_id.get(entry["player_id"], {}).get("env") or {}).get("COWORLD_LLM_ENABLED") == "true"
+}
+if not log_path.exists():
+    raise SystemExit("FAIL: local HTTP LLM fixture recorded zero calls")
+calls = [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
+if not calls:
+    raise SystemExit("FAIL: local HTTP LLM fixture recorded zero calls")
+seen_slots = {c["slot"] for c in calls}
+unexpected = seen_slots - model_slots
+if unexpected:
+    raise SystemExit(f"FAIL: unexpected LLM calls from non-model slots: {unexpected}")
+if not (seen_slots & model_slots):
+    raise SystemExit(f"FAIL: no model slot called LLM fixture (expected subset of {model_slots}, saw {seen_slots})")
+print(f"fixture LLM calls OK: total={len(calls)} slots={sorted(seen_slots)} fenced={sum(1 for c in calls if c.get('fenced'))}")
+PY
 fi
 
 # --------------------------------------------------------------------------

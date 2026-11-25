@@ -4,9 +4,9 @@
 ## strategy covering both roles), then idles until the final frame. All of the
 ## prompt decisions use the game's Claude adapter.
 ##
-## PLAYER_SCRIPTED=tally (or 1) registers the seat as the built-in
-## truth-tracking baseline instead; PLAYER_SCRIPTED=hedge as the
-## card-counting one. The server plays those deterministically, no LLM.
+## PLAYER_SCRIPTED=tally registers the seat as the built-in truth-tracking
+## baseline instead; PLAYER_SCRIPTED=hedge registers the card-counting one.
+## The server plays explicit scripted seats deterministically with no LLM.
 ##
 ## To field your own policy, reuse this image and set PLAYER_PROMPT:
 ##   coworld upload-policy <tribunal-image> --name my-tribunal \

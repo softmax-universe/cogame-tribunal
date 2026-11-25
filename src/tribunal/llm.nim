@@ -1,25 +1,20 @@
-## Claude-backed decision making for Tribunal. Each seat's policy is just a
+## LLM-backed decision making for Tribunal. Each prompt seat's policy is a
 ## prompt: the game server composes the seat's role-specific view (the case,
 ## its own hand or the public record, the transcript, the disclosure counts,
 ## the whispers it is allowed to hear, its notes) plus that seat's prompt and
-## asks Claude what it does.
+## sends one parallel batch per turn (curly.makeRequests).
 ##
-## Decisions inside a turn are simultaneous by rule, so every pending seat's
-## request goes out as ONE parallel batch (curly.makeRequests) — five in an
-## argument round, three in the ballot. Invalid replies are retried once as a
-## smaller batch with a hint, and anything still failing falls back to the
-## scripted `tally` baseline. A default episode is 5 batched round-trips, not
-## 25.
+## Every pending model seat's request goes out as ONE parallel batch per turn
+## (curly.makeRequests). If any model seat fails (missing credentials,
+## transport/HTTP error, timeout, parse error, or illegal action), decideAll
+## raises PolicyDecisionError immediately and NEVER retries or substitutes a
+## scripted baseline move. Explicit scripted seats (`tally`, `hedge`) always
+## run their deterministic baseline without an LLM.
 ##
 ## Credentials, in order of preference:
 ##   COWORLD_LLM_ENDPOINT            - hosted sidecar
-##   Bedrock bearer token            - local play
-##   ANTHROPIC_API_KEY                - the key itself
-##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## With no credentials every decision falls back to the always-legal scripted
-## baseline immediately (no retries, no network waits) so offline
-## certification still completes - this fallback is load-bearing. The same
-## scripted bots are also fieldable policies.
+##   ANTHROPIC_API_KEY               - direct Anthropic API key
+##   ANTHROPIC_API_KEY_URI           - a URI holding the key
 
 import
   std/[algorithm, json, os, strutils, unicode],
@@ -31,9 +26,13 @@ import
 const
   AnthropicUrl = "https://api.anthropic.com/v1/messages"
   AnthropicVersion = "2023-06-01"
-  BedrockAnthropicVersion = "bedrock-2023-05-31"
 
 type
+  PolicyDecisionError* = object of TribunalError
+    seat*: int
+    cause*: string
+    rawReply*: string
+
   ScriptKind* = enum
     skNone = "none"
     skTally = "tally"
@@ -52,33 +51,29 @@ type
     vote*: string            ## juror, ballot
     reason*: string          ## juror, ballot
     notes*: string           ## "" when the reply carried none
-    scripted*: bool          ## came from a scripted baseline, LLM reply or not
+    scripted*: bool          ## true only for explicit scripted seats
 
-  LlmTransport = enum
-    ltNone, ltSidecar, ltBedrock, ltAnthropic
+  LlmTransport* = enum
+    ltNone, ltSidecar, ltAnthropic
 
   LlmClient* = ref object
     curl: Curly
-    transport: LlmTransport
+    transport*: LlmTransport
     apiKey: string          ## anthropic transport
     sidecarEndpoint: string
-    bedrockEndpoint: string ## local Bedrock transport
-    bedrockModels: seq[string]  ## candidates, tried in order on denial
-    bedrockModel: int           ## index into bedrockModels
-    bedrockToken: string
-    model: string         ## direct-Anthropic transport only; Bedrock
-                          ## picks from bedrockModels instead
+    model*: string
     maxOutputTokens: int
     timeoutSeconds: int
-    disabled*: bool   ## true once credentials are known-unavailable
 
 proc parseScriptKind*(text: string): ScriptKind =
-  ## PLAYER_SCRIPTED values: "1"/"true"/"yes"/"tally" play the truth-tracking
-  ## baseline, "hedge" the card-counting one, anything else nothing.
-  case text.strip().toLowerAscii()
-  of "1", "true", "yes", "tally": skTally
+  ## PLAYER_SCRIPTED values: "tally" plays the truth-tracking baseline,
+  ## "hedge" plays the card-counting baseline, "" means model-driven.
+  case text.strip()
+  of "": skNone
+  of "tally": skTally
   of "hedge": skHedge
-  else: skNone
+  else:
+    raise newException(TribunalError, "unknown scripted baseline: " & text)
 
 proc resolveApiKey(): string =
   result = getEnv("ANTHROPIC_API_KEY").strip()
@@ -93,39 +88,6 @@ proc resolveApiKey(): string =
     echo "tribunal llm: failed to fetch ANTHROPIC_API_KEY_URI: ", error.msg
     result = ""
 
-proc bedrockModelIds(): seq[string] =
-  ## Bedrock inference-profile candidates, tried in order. BEDROCK_MODEL pins
-  ## a single id; without it, fall through this list — model access is a
-  ## per-account Marketplace subscription, so an id that works in one account
-  ## 403s in another.
-  ## The config "model" field is NOT consulted here: it applies to
-  ## the direct-Anthropic transport only, and the haiku-first
-  ## ordering is a shared-capacity decision that trumps per-game
-  ## preference.
-  let pinned = getEnv("BEDROCK_MODEL").strip()
-  if pinned.len > 0:
-    return @[pinned]
-  ## Haiku leads: hosted Bedrock capacity is shared account-wide and the
-  ## sonnet profiles run out of daily tokens first.
-  @[
-    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-    "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-  ]
-
-proc tryNextBedrockModel(client: LlmClient, why: string): bool =
-  if client.transport != ltBedrock or
-      client.bedrockModel + 1 >= client.bedrockModels.len:
-    return false
-  client.bedrockModel.inc
-  echo "tribunal llm: ", client.bedrockModels[client.bedrockModel - 1],
-    " unusable (", why, "); falling back to ",
-    client.bedrockModels[client.bedrockModel]
-  true
-
-proc bedrockUrl(client: LlmClient): string =
-  client.bedrockEndpoint & "/model/" &
-    client.bedrockModels[client.bedrockModel] & "/invoke"
-
 proc newLlmClient*(config: GameConfig): LlmClient =
   result = LlmClient(
     model: config.model,
@@ -138,23 +100,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
     result.sidecarEndpoint = sidecarEndpoint.strip(chars = {'/'}, leading = false)
     result.model = getEnv("COWORLD_LLM_MODEL", "anthropic/claude-haiku-4.5")
     result.curl = newCurly()
-    return
-  let bedrockEndpoint = getEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME").strip()
-  let bedrockToken = getEnv("AWS_BEARER_TOKEN_BEDROCK").strip()
-  if bedrockEndpoint.len > 0 or bedrockToken.len > 0:
-    let region = getEnv("AWS_REGION",
-      getEnv("AWS_DEFAULT_REGION", "us-west-2"))
-    let endpoint =
-      if bedrockEndpoint.len > 0: bedrockEndpoint
-      else: "https://bedrock-runtime." & region & ".amazonaws.com"
-    result.transport = ltBedrock
-    result.bedrockEndpoint = endpoint.strip(chars = {'/'}, leading = false)
-    result.bedrockModels = bedrockModelIds()
-    result.bedrockToken = bedrockToken
-    result.curl = newCurly()
-    echo "tribunal llm: bedrock transport, model ",
-      result.bedrockModels[result.bedrockModel],
-      ", url ", result.bedrockUrl
+    echo "tribunal llm: sidecar transport, model ", result.model
     return
   result.apiKey = resolveApiKey()
   if result.apiKey.len > 0:
@@ -163,8 +109,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
     echo "tribunal llm: anthropic transport, model ", result.model
   else:
     result.transport = ltNone
-    result.disabled = true
-    echo "tribunal llm: no LLM credentials; using scripted fallback"
+    echo "tribunal llm: no LLM credentials configured (explicit scripted seats only)"
 
 # ---- Turn shape -------------------------------------------------------------
 
@@ -234,26 +179,25 @@ proc scriptedAction*(sim: Sim, seat: int, kind: ScriptKind): Decision =
   ## Rule-based baseline for `seat`, always legal by construction: it only
   ## ever names cards it holds. `tally` weighs the record's strengths;
   ## `hedge` counts its cards and holds evidence back until the closing
-  ## round. Both are the fallback for a failed LLM decision (as `tally`) and
-  ## fieldable policies in their own right.
-  let script = if kind == skNone: skTally else: kind
+  ## round. Explicit scripted policies only — never a fallback for a model.
+  if kind == skNone:
+    raise newException(TribunalError,
+      "scriptedAction requires an explicit scripted baseline")
   let role = sim.roleOf[seat]
-  ## Stamped on the decision itself so the caller can record the provenance
-  ## of a decision it did not ask for — an LLM seat that fell back.
   result.scripted = true
   if role == 2:
-    let call = if script == skHedge: hedgeVote(sim) else: sim.tallyVote()
+    let call = if kind == skHedge: hedgeVote(sim) else: sim.tallyVote()
     if sim.phase == phBallot:
       result.vote = call
       result.reason =
-        if script == skHedge: hedgeReason(sim) else: sim.tallyReason()
+        if kind == skHedge: hedgeReason(sim) else: sim.tallyReason()
     else:
       result.lean = call
     return
   var picks = ownSideCards(sim, role)
   let closing = sim.round >= sim.config.rounds - 1
   let allowance =
-    if script == skHedge and not closing: 1
+    if kind == skHedge and not closing: 1
     else: MaxIntroducePerTurn
   if picks.len > allowance:
     picks = picks[0 ..< allowance]
@@ -512,50 +456,67 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
       $MaxReasonLen & " characters; notes at most " & $MaxNotesLen &
       " characters.")
 
-# ---- Anthropic / Bedrock transport ------------------------------------------
+# ---- Sidecar / Anthropic transport ------------------------------------------
 
-proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first {...} object out of a model response, tolerating fences.
-  let start = text.find('{')
-  let stop = text.rfind('}')
-  if start < 0 or stop <= start:
-    ## Quote the head of the reply so a hosted log shows WHAT the model sent
-    ## instead of JSON (prose, a refusal, a cut-off analysis...).
-    var head = text.strip()
-    if head.runeLen > 160:
-      head = head.runeSubStr(0, 160) & "..."
-    raise newException(TribunalError, "no JSON object in response: " &
-      head.replace("\n", " "))
-  parseJson(text[start .. stop])
+proc snippet*(text: string, limit = 160): string =
+  result = text.replace("\r", " ").replace("\n", " ").strip()
+  if result.runeLen > limit:
+    result = result.runeSubStr(0, limit) & "..."
+
+proc unwrapSingleJsonFence*(text: string): string =
+  ## Accepts either bare text or a single outer Markdown fence (``` or ```json).
+  ## Rejects prose outside the fence, unsupported fence languages, unclosed
+  ## fences, and multiple fences.
+  let trimmed = text.strip()
+  if not trimmed.startsWith("```"):
+    return trimmed
+  let newline = trimmed.find('\n')
+  if newline < 0:
+    raise newException(TribunalError, "unclosed markdown fence")
+  let header = trimmed[3 ..< newline].strip().toLowerAscii()
+  if header.len > 0 and header != "json":
+    raise newException(TribunalError, "unsupported markdown fence: " & header)
+  let rest = trimmed[newline + 1 .. ^1]
+  let closing = rest.rfind("```")
+  if closing < 0:
+    raise newException(TribunalError, "unclosed markdown fence")
+  if rest[closing + 3 .. ^1].strip().len > 0:
+    raise newException(TribunalError, "trailing text after markdown fence")
+  let inner = rest[0 ..< closing].strip()
+  if "```" in inner:
+    raise newException(TribunalError, "multiple markdown fences in response")
+  inner
+
+proc parseJsonObject*(text: string): JsonNode =
+  ## Parses a single JSON object (optionally wrapped in one outer Markdown
+  ## JSON fence). Surrounding prose and non-object JSON values are rejected.
+  let body = unwrapSingleJsonFence(text)
+  if body.len == 0 or body[0] != '{' or body[^1] != '}':
+    raise newException(TribunalError, "expected JSON object in response: " &
+      snippet(text))
+  let parsed = parseJson(body)
+  if parsed.kind != JObject:
+    raise newException(TribunalError, "expected JSON object in response: " &
+      snippet(text))
+  parsed
 
 proc requestFor(client: LlmClient, system, user: string, slot: int):
     tuple[url: string, headers: HttpHeaders, body: string] =
   var body = %*{
+    "model": client.model,
     "max_tokens": client.maxOutputTokens,
     "system": system,
     "messages": [{"role": "user", "content": user}]
   }
   var headers: HttpHeaders
-  if client.transport == ltSidecar and slot >= 0:
-    headers["X-Coworld-Player-Slot"] = $slot
   headers["content-type"] = "application/json"
-  if client.transport == ltBedrock:
-    body["anthropic_version"] = %BedrockAnthropicVersion
-    if client.bedrockToken.len > 0:
-      headers["authorization"] = "Bearer " & client.bedrockToken
-    result.url = client.bedrockUrl()
-  elif client.transport == ltSidecar:
-    body["model"] = %client.model
-    headers["anthropic-version"] = AnthropicVersion
+  headers["anthropic-version"] = AnthropicVersion
+  if client.transport == ltSidecar:
+    if slot >= 0:
+      headers["X-Coworld-Player-Slot"] = $slot
     result.url = client.sidecarEndpoint & "/v1/messages"
   else:
-    body["model"] = %client.model
-    ## Only the Claude 5 / Opus tiers accept an effort setting; Haiku 4.5
-    ## rejects the whole request with a 400 if it is present.
-    if "haiku" notin client.model and "4-5" notin client.model:
-      body["output_config"] = %*{"effort": "low"}
     headers["x-api-key"] = client.apiKey
-    headers["anthropic-version"] = AnthropicVersion
     result.url = AnthropicUrl
   result.headers = headers
   result.body = $body
@@ -563,35 +524,30 @@ proc requestFor(client: LlmClient, system, user: string, slot: int):
 proc textOf(client: LlmClient, response: Response, error, url: string):
     string =
   ## The text of one batched reply, or a TribunalError describing why there is
-  ## none. Auth failures disable the client; model-access and throttle
-  ## failures rotate the Bedrock model for the next batch.
+  ## none.
   if error.len > 0:
     raise newException(TribunalError, "llm transport: " & error)
   if response.code == 401 or response.code == 403:
     let detail = response.body[0 .. min(response.body.high, 400)]
-    if "Model access is denied" in response.body and
-        client.tryNextBedrockModel("no model access"):
-      raise newException(TribunalError,
-        "bedrock model access denied: " & detail)
-    client.disabled = true
     raise newException(TribunalError,
       "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
   if response.code == 429:
     let detail = response.body[0 .. min(response.body.high, 300)]
-    discard client.tryNextBedrockModel("throttled")
     raise newException(TribunalError, "llm throttled (429): " & detail)
   if response.code < 200 or response.code >= 300:
-    raise newException(TribunalError, "anthropic error " & $response.code &
+    raise newException(TribunalError, "llm error " & $response.code &
       ": " & response.body[0 .. min(response.body.high, 300)])
   let payload = parseJson(response.body)
   if payload{"stop_reason"}.getStr() == "refusal":
-    raise newException(TribunalError, "anthropic refusal")
+    raise newException(TribunalError, "llm refusal")
+  if not payload.hasKey("content") or payload["content"].kind != JArray:
+    raise newException(TribunalError, "missing content array in llm response")
   for contentBlock in payload["content"]:
     if contentBlock{"type"}.getStr() == "text":
       result.add(contentBlock{"text"}.getStr())
   if payload{"stop_reason"}.getStr() == "max_tokens" and '{' notin result:
     raise newException(TribunalError, "reply cut off at max_tokens before " &
-      "any JSON: " & result[0 .. min(result.high, 160)].replace("\n", " "))
+      "any JSON: " & snippet(result))
 
 # ---- Reply parsing ----------------------------------------------------------
 
@@ -602,46 +558,68 @@ proc cleanText*(text: string, limit: int): string =
     return
   result = result.runeSubStr(0, limit - 1) & "…"
 
+proc optionalStringField(payload: JsonNode, field: string): string =
+  if not payload.hasKey(field) or payload[field].kind == JNull:
+    return ""
+  if payload[field].kind != JString:
+    raise newException(TribunalError, field & " must be a string")
+  payload[field].getStr()
+
+proc requiredStringField(payload: JsonNode, field: string): string =
+  if not payload.hasKey(field) or payload[field].kind != JString:
+    raise newException(TribunalError, field & " must be a string")
+  payload[field].getStr()
+
 proc parseAdvocateReply*(payload: JsonNode): Decision =
   ## {"introduce": ["E7","E2"], "argument": "…", "notes": "…"}.
-  ## A missing or unusable `introduce` degrades to introducing nothing; an
-  ## empty argument is invalid.
-  result.notes = cleanText(payload{"notes"}.getStr(), MaxNotesLen)
-  let node = payload{"introduce"}
-  if not node.isNil and node.kind == JArray:
+  ## `introduce` is optional (defaults to []) and must be an array of strings;
+  ## `argument` is required and non-empty.
+  if payload.kind != JObject:
+    raise newException(TribunalError, "advocate reply must be a JSON object")
+  result.notes = cleanText(optionalStringField(payload, "notes"), MaxNotesLen)
+  if payload.hasKey("introduce") and payload["introduce"].kind != JNull:
+    let node = payload["introduce"]
+    if node.kind != JArray:
+      raise newException(TribunalError, "introduce must be an array of card ids")
     for id in node:
-      if result.introduce.len >= MaxIntroducePerTurn:
-        break
-      if id.kind == JString:
+      if id.kind != JString:
+        raise newException(TribunalError, "introduce entries must be strings")
+      if result.introduce.len < MaxIntroducePerTurn:
         result.introduce.add(id.getStr().strip())
-  elif not node.isNil and node.kind == JString and
-      node.getStr().strip().len > 0:
-    result.introduce.add(node.getStr().strip())
+  let rawArg = requiredStringField(payload, "argument")
   result.argument = cleanText(
-    payload{"argument"}.getStr().replace("\n", " ").replace("\r", " "),
+    rawArg.replace("\n", " ").replace("\r", " "),
     MaxArgumentLen)
   if result.argument.len == 0:
     raise newException(TribunalError, "no argument in response")
 
 proc parseJurorReply*(payload: JsonNode): Decision =
-  ## {"whisper": "…", "lean": "guilty", "notes": "…"} — everything optional;
-  ## an unrecognised lean is `undecided`.
-  result.notes = cleanText(payload{"notes"}.getStr(), MaxNotesLen)
+  ## {"whisper": "…", "lean": "guilty|not_guilty|undecided", "notes": "…"}.
+  ## `lean` is required and must be canonical; `whisper` and `notes` are optional.
+  if payload.kind != JObject:
+    raise newException(TribunalError, "juror reply must be a JSON object")
+  result.notes = cleanText(optionalStringField(payload, "notes"), MaxNotesLen)
   result.whisper = cleanText(
-    payload{"whisper"}.getStr().replace("\n", " ").replace("\r", " "),
+    optionalStringField(payload, "whisper").replace("\n", " ").replace("\r", " "),
     MaxWhisperLen)
-  result.lean = normalizeLean(payload{"lean"}.getStr())
+  let rawLean = requiredStringField(payload, "lean")
+  result.lean = normalizeLean(rawLean)
+  if result.lean.len == 0:
+    raise newException(TribunalError, "invalid lean in response: " & rawLean)
 
 proc parseVoteReply*(payload: JsonNode): Decision =
-  ## {"vote": "guilty", "reason": "…", "notes": "…"} — the vote is required.
-  result.notes = cleanText(payload{"notes"}.getStr(), MaxNotesLen)
+  ## {"vote": "guilty|not_guilty", "reason": "…", "notes": "…"}.
+  ## `vote` is required and must be canonical.
+  if payload.kind != JObject:
+    raise newException(TribunalError, "vote reply must be a JSON object")
+  result.notes = cleanText(optionalStringField(payload, "notes"), MaxNotesLen)
   result.reason = cleanText(
-    payload{"reason"}.getStr().replace("\n", " ").replace("\r", " "),
+    optionalStringField(payload, "reason").replace("\n", " ").replace("\r", " "),
     MaxReasonLen)
-  result.vote = normalizeVote(payload{"vote"}.getStr())
+  let rawVote = requiredStringField(payload, "vote")
+  result.vote = normalizeVote(rawVote)
   if result.vote.len == 0:
-    raise newException(TribunalError,
-      "no vote in response: " & payload{"vote"}.getStr())
+    raise newException(TribunalError, "invalid vote in response: " & rawVote)
 
 proc parseReply*(sim: Sim, seat: int, payload: JsonNode): Decision =
   case sim.turnKind(seat)
@@ -683,6 +661,14 @@ proc actionFromEvent*(event: GameEvent): JsonNode =
 
 # ---- The turn's batch -------------------------------------------------------
 
+proc raisePolicyFailure(seat: int, cause, detail: string, rawReply = "") =
+  var err = newException(PolicyDecisionError,
+    "seat " & $seat & " policy decision failed (" & cause & "): " & detail)
+  err.seat = seat
+  err.cause = cause
+  err.rawReply = rawReply
+  raise err
+
 proc decideAll*(
   client: LlmClient,
   sim: Sim,
@@ -692,47 +678,51 @@ proc decideAll*(
   selection: PromptSelection
 ): seq[Decision] =
   ## One decision per seat in `seats`, in order — the whole turn as ONE
-  ## parallel batch, because the seats decide simultaneously. Never raises:
-  ## any failure falls back to the scripted baseline so the episode always
-  ## advances. `prompts` and `scripted` are indexed by SEAT.
+  ## parallel batch, because the seats decide simultaneously. Explicit scripted
+  ## seats run their baseline; model seats require a configured LLM transport
+  ## and raise PolicyDecisionError if they fail after retry (never falling back
+  ## to a scripted baseline). `prompts` and `scripted` are indexed by SEAT.
   result = newSeq[Decision](seats.len)
   var open: seq[int]     ## indexes into `seats` still undecided
   for index, seat in seats:
     let kind = scripted[seat]
-    if kind != skNone or client.disabled:
+    if kind != skNone:
       result[index] = scriptedAction(sim, seat, kind)
     else:
       open.add(index)
-  for attempt in 0 .. 1:
-    if open.len == 0 or client.disabled:
-      break
-    var batch: RequestBatch
-    for index in open:
-      let seat = seats[index]
-      var user = sim.userPrompt(seat, prompts[seat])
-      if attempt > 0:
-        user.add("\nYour previous reply was invalid. Respond with ONLY the " &
-          "requested JSON object.")
-      let request = client.requestFor(systemPrompt(sim, seat, selection), user, seat)
-      batch.post(request.url, request.headers, request.body, $index)
-    let responses = client.curl.makeRequests(batch, client.timeoutSeconds)
-    var stillOpen: seq[int]
-    for position, index in open:
-      let seat = seats[index]
-      try:
-        let text = client.textOf(responses[position].response,
-          responses[position].error, batch[position].url)
-        let decision = sim.parseReply(seat, extractJsonObject(text))
-        ## Reject illegal replies here so the retry carries the hint.
-        var probe = sim
-        probe.applyDecision(seat, decision, false)
-        result[index] = decision
-      except CatchableError as error:
-        echo "tribunal llm: seat ", seat, " attempt ", attempt, " failed: ",
-          error.msg
-        stillOpen.add(index)
-    open = stillOpen
+  if open.len == 0:
+    return
+  if client.transport == ltNone:
+    let failedSeat = seats[open[0]]
+    raisePolicyFailure(failedSeat, "no_credentials",
+      "no LLM endpoint or API key configured for model seat " & $failedSeat)
+  var batch: RequestBatch
   for index in open:
     let seat = seats[index]
-    echo "tribunal llm: seat ", seat, " falling back to scripted decision"
-    result[index] = scriptedAction(sim, seat, skTally)
+    let user = sim.userPrompt(seat, prompts[seat])
+    let request = client.requestFor(systemPrompt(sim, seat, selection), user, seat)
+    batch.post(request.url, request.headers, request.body, $index)
+  let responses = client.curl.makeRequests(batch, client.timeoutSeconds)
+  for position, index in open:
+    let seat = seats[index]
+    var rawText = ""
+    try:
+      rawText = client.textOf(responses[position].response,
+        responses[position].error, batch[position].url)
+      let decision = sim.parseReply(seat, parseJsonObject(rawText))
+      var probe = sim
+      probe.applyDecision(seat, decision, false)
+      result[index] = decision
+    except CatchableError as error:
+      let cause =
+        if rawText.len == 0: "transport_error"
+        else: "parse_error"
+      let rawHead = snippet(rawText)
+      echo "tribunal llm: seat ", seat, " failed (", cause, "): ", error.msg,
+        (if rawHead.len > 0: " | raw=" & rawHead else: "")
+      let detail =
+        if rawHead.len > 0 and rawHead notin error.msg:
+          error.msg & " | raw=" & rawHead
+        else:
+          error.msg
+      raisePolicyFailure(seat, cause, detail, rawHead)

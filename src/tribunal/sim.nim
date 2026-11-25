@@ -628,11 +628,13 @@ proc applyArgument*(sim: var Sim, seat: int, cardIds: seq[string],
     sim.resolveRound()
 
 proc normalizeLean*(text: string): string =
-  case text.strip().toLowerAscii().replace(" ", "_")
-  of "guilty", "g", "guilt", "convict": "guilty"
-  of "not_guilty", "notguilty", "innocent", "acquit", "n", "innocence":
-    "not_guilty"
-  else: "undecided"
+  ## Strictly accepts canonical lean tokens ("guilty", "not_guilty",
+  ## "undecided"); returns "" on any unrecognized value.
+  case text.strip()
+  of "guilty": "guilty"
+  of "not_guilty": "not_guilty"
+  of "undecided": "undecided"
+  else: ""
 
 proc applyWhisper*(sim: var Sim, seat: int, whisper, lean, notes: string,
     scripted: bool) =
@@ -651,6 +653,8 @@ proc applyWhisper*(sim: var Sim, seat: int, whisper, lean, notes: string,
       sim.names[seat] & " has already whispered this round")
   let text = tidy(whisper, MaxWhisperLen)
   let leaning = normalizeLean(lean)
+  if leaning.len == 0:
+    raise newException(TribunalError, "invalid lean: " & lean)
   sim.leans[sim.juryIndex[seat]] = leaning
   sim.whispers.add((round: sim.round, seat: seat, text: text, lean: leaning))
   if notes.len > 0:
@@ -669,11 +673,11 @@ proc applyWhisper*(sim: var Sim, seat: int, whisper, lean, notes: string,
     sim.resolveRound()
 
 proc normalizeVote*(text: string): string =
-  ## "" when the reply carries nothing that can be read as a vote.
-  case text.strip().toLowerAscii().replace(" ", "_")
-  of "guilty", "g", "guilt", "convict": "guilty"
-  of "not_guilty", "notguilty", "innocent", "innocence", "acquit", "n":
-    "not_guilty"
+  ## Strictly accepts canonical vote tokens ("guilty" or "not_guilty");
+  ## returns "" otherwise.
+  case text.strip()
+  of "guilty": "guilty"
+  of "not_guilty": "not_guilty"
   else: ""
 
 proc applyVote*(sim: var Sim, seat: int, vote, reason, notes: string,
