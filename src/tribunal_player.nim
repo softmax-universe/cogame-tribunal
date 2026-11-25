@@ -42,15 +42,20 @@ when isMainModule:
   if prompt.len == 0:
     prompt = DefaultPrompt
   let scripted = getEnv("PLAYER_SCRIPTED").strip()
+  let model = getEnv("COWORLD_LLM_MODEL").strip()
 
   proc promptFrame(): string =
-    $ %*{"type": "prompt", "prompt": prompt, "scripted": scripted}
+    var frame = %*{"type": "prompt", "prompt": prompt, "scripted": scripted}
+    if model.len > 0:
+      frame["model"] = %model
+    $frame
 
   echo "tribunal player: connecting to game"
   let socket = newWebSocket(url)
   socket.send(promptFrame())
   echo "tribunal player: prompt delivered (", prompt.len, " chars",
-    (if scripted.len > 0: ", scripted " & scripted else: ""), ")"
+    (if scripted.len > 0: ", scripted " & scripted else: ""),
+    (if model.len > 0: ", model " & model else: ""), ")"
 
   ## whisky RAISES on a close frame or a truncated read (only a timeout
   ## returns none), and the game's quit(0) can outrun the flushed final
@@ -78,6 +83,12 @@ when isMainModule:
         of "final":
           echo "tribunal player: final scores ", payload{"scores"},
             " verdict ", payload{"verdict"}
+          break
+        of "error":
+          echo "tribunal player: episode error (seat ",
+            payload{"failed_policy_index"}.getInt(-1), ", ",
+            payload{"kind"}.getStr("player_error"), "): ",
+            payload{"message"}.getStr()
           break
         else:
           discard

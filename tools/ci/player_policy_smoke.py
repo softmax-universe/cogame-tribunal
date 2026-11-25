@@ -3,14 +3,17 @@
 
 Verifies:
 1. Ordinary mixed gameplay (2 model seats + 3 explicit scripted opponents)
-   completes against the local HTTP /v1/messages fixture, records real model
-   calls ONLY for model seats (including a single Markdown JSON fence), and
-   writes valid results.json + replay.json with zero fallbacks.
+   completes against the local HTTP /v1/chat/completions fixture, records real
+   model calls ONLY for model seats (including a single Markdown JSON fence and
+   per-seat COWORLD_LLM_MODEL propagation), and writes valid results.json +
+   replay.json with zero fallbacks.
 2. Missing LLM credentials for a model seat fails terminally with Coworld's
-   strict GamePlayerFailure schema and NO results.json / NO scores.
+   strict GamePlayerFailure schema (player_error) and NO results.json / NO scores.
 3. Invalid model reply fails immediately (no retry, no fallback) with
-   GamePlayerFailure preserving the raw reply as diagnostic evidence and NO
-   results.json / NO scores.
+   GamePlayerFailure (player_error) preserving the raw reply and NO results.json.
+4. Mid-episode backend outage (HTTP 503 after round 1 succeeds) preserves
+   genuine HTTP-to-game progress from round 1 and terminates cleanly with
+   GamePlayerFailure (episode_inconclusive) and NO results.json / NO default scores.
 """
 
 from __future__ import annotations
@@ -35,7 +38,12 @@ def free_port() -> int:
         return int(s.getsockname()[1])
 
 
-def start_fixture(work: Path, invalid_response: str | None = None) -> tuple[subprocess.Popen, int, Path]:
+def start_fixture(
+    work: Path,
+    invalid_response: str | None = None,
+    fail_after_calls: int | None = None,
+    fail_status: int = 503,
+) -> tuple[subprocess.Popen, int, Path]:
     port_file = work / "fixture.port"
     log_file = work / "fixture_calls.jsonl"
     cmd = [
@@ -48,6 +56,8 @@ def start_fixture(work: Path, invalid_response: str | None = None) -> tuple[subp
     ]
     if invalid_response is not None:
         cmd += ["--invalid-response", invalid_response]
+    if fail_after_calls is not None:
+        cmd += ["--fail-after-calls", str(fail_after_calls), "--fail-status", str(fail_status)]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     for _ in range(50):
         if port_file.exists() and port_file.read_text().strip():
@@ -62,6 +72,7 @@ def run_episode(
     player_bin: Path,
     work: Path,
     llm_endpoint: str | None,
+    slot_model_overrides: dict[int, str] | None = None,
 ) -> tuple[int, str, Path, Path, Path]:
     manifest = json.loads(MANIFEST_PATH.read_text())
     cert = manifest["certification"]
@@ -114,6 +125,8 @@ def run_episode(
         p_env["COWORLD_PLAYER_WS_URL"] = f"ws://127.0.0.1:{port}/player?slot={slot}&token=tok-{slot}"
         for k, v in (entry.get("env") or {}).items():
             p_env[k] = str(v)
+        if slot_model_overrides and slot in slot_model_overrides:
+            p_env["COWORLD_LLM_MODEL"] = slot_model_overrides[slot]
         player_procs.append(
             subprocess.Popen([str(player_bin)], env=p_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         )
@@ -136,13 +149,17 @@ def main() -> None:
     game_bin = Path(sys.argv[1]).resolve()
     player_bin = Path(sys.argv[2]).resolve()
 
-    # 1. Ordinary mixed episode with local HTTP fixture.
+    # 1. Ordinary mixed episode with per-seat registry model propagation.
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         fix_proc, fix_port, log_file = start_fixture(work)
         try:
             rc, out, results_path, replay_path, failure_path = run_episode(
-                game_bin, player_bin, work, f"http://127.0.0.1:{fix_port}"
+                game_bin,
+                player_bin,
+                work,
+                f"http://127.0.0.1:{fix_port}",
+                slot_model_overrides={2: "openai/gpt-4o-mini"},
             )
         finally:
             fix_proc.terminate()
@@ -155,14 +172,18 @@ def main() -> None:
         assert len(results["scores"]) == 5
         calls = [json.loads(line) for line in log_file.read_text().splitlines() if line.strip()]
         assert len(calls) > 0, "expected real HTTP model calls"
+        assert all(c["path"] == "/v1/chat/completions" for c in calls), "expected /v1/chat/completions sidecar route"
         seen_slots = {c["slot"] for c in calls}
-        assert seen_slots <= {0, 2} and seen_slots == {0, 2}, f"expected calls only from model slots {{0, 2}}, got {seen_slots}"
+        assert seen_slots == {0, 2}, f"expected calls only from model slots {{0, 2}}, got {seen_slots}"
+        models_by_slot = {c["slot"]: c["model"] for c in calls}
+        assert models_by_slot[0] == "anthropic/claude-haiku-4.5", f"unexpected slot 0 model: {models_by_slot}"
+        assert models_by_slot[2] == "openai/gpt-4o-mini", f"expected per-seat override for slot 2: {models_by_slot}"
         assert any(c["fenced"] for c in calls), "expected at least one single-fenced JSON response"
         model_events = [e for e in replay["events"] if e.get("seat") in (0, 2) and e.get("kind") in ("argue", "whisper", "vote")]
         assert model_events and all(e["scripted"] is False for e in model_events), "model seats must not be marked scripted"
-        print(f"mixed episode OK: calls={len(calls)} slots={sorted(seen_slots)} fenced={sum(c['fenced'] for c in calls)} reason={results['reason']}")
+        print(f"mixed episode OK: calls={len(calls)} slots={sorted(seen_slots)} models={models_by_slot} fenced={sum(c['fenced'] for c in calls)} reason={results['reason']}")
 
-    # 2. Missing credentials -> terminal GamePlayerFailure, no results/scores.
+    # 2. Missing credentials -> terminal GamePlayerFailure (player_error), no results/scores.
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         rc, out, results_path, replay_path, failure_path = run_episode(game_bin, player_bin, work, None)
@@ -196,9 +217,33 @@ def main() -> None:
         assert failure["kind"] == "player_error"
         assert "convict" in failure["message"], f"expected raw invalid reply preserved in message: {failure}"
         calls = [json.loads(line) for line in log_file.read_text().splitlines() if line.strip()]
-        # 2 model seats in round 1 = 1 batch of 2 calls (zero retries!)
         assert len(calls) == 2, f"expected exactly 2 calls (1 batch, zero retries), got {len(calls)}"
         print(f"invalid-reply failure OK: calls={len(calls)} failure={failure}")
+
+    # 4. Mid-episode backend 503 after round 1 -> partial progress + episode_inconclusive, no results/scores.
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        fix_proc, fix_port, log_file = start_fixture(work, fail_after_calls=2, fail_status=503)
+        try:
+            rc, out, results_path, replay_path, failure_path = run_episode(
+                game_bin, player_bin, work, f"http://127.0.0.1:{fix_port}"
+            )
+        finally:
+            fix_proc.terminate()
+            fix_proc.wait(timeout=5)
+        assert rc != 0, f"expected non-zero exit on backend outage\n{out}"
+        assert not results_path.exists(), "results.json must not be written on backend outage"
+        assert not replay_path.exists(), "replay.json must not be written on backend outage"
+        failure = json.loads(failure_path.read_text())
+        assert set(failure.keys()) == {"failed_policy_index", "message", "kind"}
+        assert failure["failed_policy_index"] in (0, 2)
+        assert failure["kind"] == "episode_inconclusive", f"expected episode_inconclusive for 503 outage: {failure}"
+        calls = [json.loads(line) for line in log_file.read_text().splitlines() if line.strip()]
+        ok_calls = [c for c in calls if c["status"] == 200]
+        err_calls = [c for c in calls if c["status"] == 503]
+        assert len(ok_calls) == 2 and len(err_calls) >= 1, f"expected round 1 ok calls + round 2 503s, got {calls}"
+        assert "argument round 2 of 2" in out, f"expected round 1 progress before round 2 failure:\n{out}"
+        print(f"partial-progress inconclusive failure OK: ok_calls={len(ok_calls)} err_calls={len(err_calls)} failure={failure}")
 
 
 if __name__ == "__main__":

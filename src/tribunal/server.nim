@@ -45,6 +45,7 @@ type
     selection: PromptSelection
     sim: Sim
     prompts: seq[string]
+    models: seq[string]
     scripted: seq[ScriptKind]
     external: seq[bool]
     registered: seq[bool]
@@ -122,8 +123,19 @@ proc broadcastLocked(gs: GameState) =
     socket.send($gs.playerFrameJson(slot))
 
 proc writeArtifact(uri, data, contentType, methodEnv: string) =
-  ## Writes a Coworld artifact, honoring the platform's PUT/POST method hint.
+  ## Writes a Coworld artifact, atomically for file:// URIs and honoring the
+  ## platform's PUT/POST method hint for HTTP(S).
   if uri.len == 0:
+    return
+  const FilePrefix = "file://"
+  if uri.startsWith(FilePrefix):
+    let path = uri[FilePrefix.len .. ^1]
+    let parent = parentDir(path)
+    if parent.len > 0:
+      createDir(parent)
+    let tmpPath = path & ".tmp"
+    writeFile(tmpPath, data)
+    moveFile(tmpPath, path)
     return
   let httpMethod = getEnv(methodEnv, "PUT").toUpperAscii()
   if uri.isHttpCogameUri() and httpMethod == "POST":
@@ -339,6 +351,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var simCopy: Sim
       var seats: seq[int]
       var prompts: seq[string]
+      var models: seq[string]
       var scripted: seq[ScriptKind]
       var external: seq[bool]
       var decisionId: int
@@ -360,6 +373,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           simCopy = state.sim
           selection = state.selection
           prompts = state.prompts
+          models = state.models
           scripted = state.scripted
           external = state.external
           inc state.decisionId
@@ -395,11 +409,14 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       if internalSeats.len > 0:
         try:
           let internalDecisions = client.decideAll(
-            simCopy, internalSeats, prompts, scripted, selection)
+            simCopy, internalSeats, prompts, scripted, selection, models)
           for index, seat in internalSeats:
             decisionOf[seat] = internalDecisions[index]
         except PolicyDecisionError as err:
-          failEpisode(err.seat, err.msg)
+          let kind =
+            if err.inconclusive: "episode_inconclusive"
+            else: "player_error"
+          failEpisode(err.seat, err.msg, kind)
         except CatchableError as err:
           failEpisode(internalSeats[0], "policy decision failed: " & err.msg)
 
@@ -441,6 +458,8 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           except CatchableError as err:
             failEpisode(seat, "invalid external action: " & err.msg)
 
+      var applyFailedSeat = -1
+      var applyFailedMsg = ""
       withLock stateLock:
         ## Applied in ROLE order — prosecutor, defender, jurors — so the
         ## record's card order depends on the seed, not on slot numbering.
@@ -456,9 +475,13 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           try:
             state.sim.applyDecision(seat, decision, wasScripted)
           except TribunalError as error:
-            stateLock.release()
-            failEpisode(seat, "decision rejected by rules: " & error.msg)
-        state.broadcastLocked()
+            applyFailedSeat = seat
+            applyFailedMsg = "decision rejected by rules: " & error.msg
+            break
+        if applyFailedSeat < 0:
+          state.broadcastLocked()
+      if applyFailedSeat >= 0:
+        failEpisode(applyFailedSeat, applyFailedMsg)
 
       ## Pace between turns so spectators can read the courtroom.
       if config.turnDelayMs > 0:
@@ -630,14 +653,22 @@ proc websocketHandler(
             elif node.kind == JString: parseScriptKind(node.getStr())
             else:
               raise newException(TribunalError, "scripted field must be a string")
+          let modelNode = payload{"model"}
+          let model =
+            if modelNode.isNil or modelNode.kind == JNull: ""
+            elif modelNode.kind == JString: modelNode.getStr().strip()
+            else:
+              raise newException(TribunalError, "model field must be a string")
           withLock stateLock:
             state.prompts[slot] = prompt
+            state.models[slot] = model
             state.scripted[slot] = scripted
             state.external[slot] = false
             state.registered[slot] = true
           echo "tribunal: slot ", slot, " delivered a prompt (",
             prompt.len, " chars",
-            (if scripted != skNone: ", scripted " & $scripted else: ""), ")"
+            (if scripted != skNone: ", scripted " & $scripted else: ""),
+            (if model.len > 0: ", model " & model else: ""), ")"
           return
         raise newException(TribunalError, "unknown player message type: " & msgType)
       except CatchableError as error:
@@ -716,6 +747,7 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig, selection:
   state.selection = selection
   state.sim = initSim(config)
   state.prompts = newSeq[string](config.players.len)
+  state.models = newSeq[string](config.players.len)
   state.scripted = newSeq[ScriptKind](config.players.len)
   state.external = newSeq[bool](config.players.len)
   state.registered = newSeq[bool](config.players.len)

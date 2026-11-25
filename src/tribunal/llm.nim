@@ -28,10 +28,13 @@ const
   AnthropicVersion = "2023-06-01"
 
 type
+  LlmTransportError* = object of TribunalError
+
   PolicyDecisionError* = object of TribunalError
     seat*: int
     cause*: string
     rawReply*: string
+    inconclusive*: bool
 
   ScriptKind* = enum
     skNone = "none"
@@ -500,44 +503,85 @@ proc parseJsonObject*(text: string): JsonNode =
       snippet(text))
   parsed
 
-proc requestFor(client: LlmClient, system, user: string, slot: int):
+proc requestFor(client: LlmClient, system, user: string, slot: int,
+    modelOverride = ""):
     tuple[url: string, headers: HttpHeaders, body: string] =
-  var body = %*{
-    "model": client.model,
-    "max_tokens": client.maxOutputTokens,
-    "system": system,
-    "messages": [{"role": "user", "content": user}]
-  }
+  let selectedModel =
+    if modelOverride.len > 0: modelOverride
+    else: client.model
   var headers: HttpHeaders
   headers["content-type"] = "application/json"
-  headers["anthropic-version"] = AnthropicVersion
   if client.transport == ltSidecar:
+    let body = %*{
+      "model": selectedModel,
+      "max_tokens": client.maxOutputTokens,
+      "messages": [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user}
+      ]
+    }
     if slot >= 0:
       headers["X-Coworld-Player-Slot"] = $slot
-    result.url = client.sidecarEndpoint & "/v1/messages"
+    result.url = client.sidecarEndpoint & "/v1/chat/completions"
+    result.body = $body
   else:
+    let body = %*{
+      "model": selectedModel,
+      "max_tokens": client.maxOutputTokens,
+      "system": system,
+      "messages": [{"role": "user", "content": user}]
+    }
+    headers["anthropic-version"] = AnthropicVersion
     headers["x-api-key"] = client.apiKey
     result.url = AnthropicUrl
+    result.body = $body
   result.headers = headers
-  result.body = $body
 
 proc textOf(client: LlmClient, response: Response, error, url: string):
     string =
   ## The text of one batched reply, or a TribunalError describing why there is
-  ## none.
+  ## none. Transport/outage/throttle errors raise LlmTransportError so callers
+  ## can classify them as episode_inconclusive rather than blaming the policy.
   if error.len > 0:
-    raise newException(TribunalError, "llm transport: " & error)
+    raise newException(LlmTransportError, "llm transport: " & error)
   if response.code == 401 or response.code == 403:
     let detail = response.body[0 .. min(response.body.high, 400)]
     raise newException(TribunalError,
-      "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
+      "llm auth/model denied (" & $response.code & ") at " & url & ": " & detail)
   if response.code == 429:
     let detail = response.body[0 .. min(response.body.high, 300)]
-    raise newException(TribunalError, "llm throttled (429): " & detail)
+    raise newException(LlmTransportError, "llm throttled (429): " & detail)
+  if response.code >= 500:
+    raise newException(LlmTransportError, "llm backend error " & $response.code &
+      ": " & response.body[0 .. min(response.body.high, 300)])
   if response.code < 200 or response.code >= 300:
     raise newException(TribunalError, "llm error " & $response.code &
       ": " & response.body[0 .. min(response.body.high, 300)])
   let payload = parseJson(response.body)
+  if client.transport == ltSidecar:
+    if not payload.hasKey("choices") or payload["choices"].kind != JArray or
+        payload["choices"].len == 0:
+      raise newException(TribunalError, "missing choices array in llm response")
+    let choice = payload["choices"][0]
+    let finishReason = choice{"finish_reason"}.getStr()
+    if finishReason == "content_filter":
+      raise newException(TribunalError, "llm refusal (content_filter)")
+    let message = choice{"message"}
+    if message.isNil or message.kind != JObject:
+      raise newException(TribunalError, "missing message object in llm response")
+    let content = message{"content"}
+    if not content.isNil and content.kind == JString:
+      result = content.getStr()
+    elif not content.isNil and content.kind == JArray:
+      for part in content:
+        if part{"type"}.getStr() == "text":
+          result.add(part{"text"}.getStr())
+    else:
+      raise newException(TribunalError, "missing message content in llm response")
+    if finishReason == "length" and '{' notin result:
+      raise newException(TribunalError, "reply cut off at max_tokens before " &
+        "any JSON: " & snippet(result))
+    return
   if payload{"stop_reason"}.getStr() == "refusal":
     raise newException(TribunalError, "llm refusal")
   if not payload.hasKey("content") or payload["content"].kind != JArray:
@@ -661,12 +705,14 @@ proc actionFromEvent*(event: GameEvent): JsonNode =
 
 # ---- The turn's batch -------------------------------------------------------
 
-proc raisePolicyFailure(seat: int, cause, detail: string, rawReply = "") =
+proc raisePolicyFailure(seat: int, cause, detail: string, rawReply = "",
+    inconclusive = false) =
   var err = newException(PolicyDecisionError,
     "seat " & $seat & " policy decision failed (" & cause & "): " & detail)
   err.seat = seat
   err.cause = cause
   err.rawReply = rawReply
+  err.inconclusive = inconclusive
   raise err
 
 proc decideAll*(
@@ -675,13 +721,15 @@ proc decideAll*(
   seats: seq[int],
   prompts: seq[string],
   scripted: seq[ScriptKind],
-  selection: PromptSelection
+  selection: PromptSelection,
+  models: seq[string] = @[]
 ): seq[Decision] =
   ## One decision per seat in `seats`, in order — the whole turn as ONE
   ## parallel batch, because the seats decide simultaneously. Explicit scripted
   ## seats run their baseline; model seats require a configured LLM transport
-  ## and raise PolicyDecisionError if they fail after retry (never falling back
-  ## to a scripted baseline). `prompts` and `scripted` are indexed by SEAT.
+  ## and raise PolicyDecisionError immediately on failure (no retry, never
+  ## falling back to a scripted baseline). `prompts`, `scripted`, and `models`
+  ## are indexed by SEAT.
   result = newSeq[Decision](seats.len)
   var open: seq[int]     ## indexes into `seats` still undecided
   for index, seat in seats:
@@ -700,7 +748,11 @@ proc decideAll*(
   for index in open:
     let seat = seats[index]
     let user = sim.userPrompt(seat, prompts[seat])
-    let request = client.requestFor(systemPrompt(sim, seat, selection), user, seat)
+    let seatModel =
+      if seat < models.len and models[seat].len > 0: models[seat]
+      else: ""
+    let request = client.requestFor(
+      systemPrompt(sim, seat, selection), user, seat, seatModel)
     batch.post(request.url, request.headers, request.body, $index)
   let responses = client.curl.makeRequests(batch, client.timeoutSeconds)
   for position, index in open:
@@ -713,9 +765,12 @@ proc decideAll*(
       var probe = sim
       probe.applyDecision(seat, decision, false)
       result[index] = decision
+    except LlmTransportError as error:
+      echo "tribunal llm: seat ", seat, " transport failure: ", error.msg
+      raisePolicyFailure(seat, "transport_error", error.msg, inconclusive = true)
     except CatchableError as error:
       let cause =
-        if rawText.len == 0: "transport_error"
+        if rawText.len == 0: "request_error"
         else: "parse_error"
       let rawHead = snippet(rawText)
       echo "tribunal llm: seat ", seat, " failed (", cause, "): ", error.msg,
@@ -725,4 +780,4 @@ proc decideAll*(
           error.msg & " | raw=" & rawHead
         else:
           error.msg
-      raisePolicyFailure(seat, cause, detail, rawHead)
+      raisePolicyFailure(seat, cause, detail, rawHead, inconclusive = false)
