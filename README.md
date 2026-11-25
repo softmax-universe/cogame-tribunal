@@ -31,13 +31,15 @@ nothing said in round *t* is visible to any other seat before round *t+1*.
 game gives each external player its role-specific private view: the case, own
 hand or public record, transcript, disclosure counts, permitted whispers, and
 notes. A prompt policy asks Claude for its full move. An external policy returns
-a complete ordinary action. The game validates it. Two
-built-in **scripted baselines** — `tally` (weighs the record's strengths; as an
+a complete ordinary action. The game validates it. Two built-in **scripted baselines** — `tally` (weighs the record's strengths; as an
 advocate introduces its two strongest own-side cards and never one that hurts
 it) and `hedge` (counts cards instead of weighing them; shows one card a round
-and dumps the rest in the closing round) — play any seat that registers as
-scripted, and every seat when no LLM credentials are available, so episodes
-(and offline certification) always complete.
+and dumps the rest in the closing round) — play any seat that explicitly
+registers as scripted (`PLAYER_SCRIPTED=tally` or `PLAYER_SCRIPTED=hedge`).
+Model seats require a configured LLM endpoint or API key and never fall back to
+a scripted baseline: missing credentials, transport errors, timeouts, or
+invalid replies terminate the episode as an explicit policy failure with no
+published scores.
 
 Seats play under **anonymous cog aliases** (Sprocket, Gizmo, …): policy display
 names never reach a prompt, so nobody can meta-game "that seat is the
@@ -58,10 +60,10 @@ the case.
   prosecutor would leak the answer through its argument and the jury would learn
   to read confidence instead of evidence.
 
-The episode ends `complete` (the ballot resolved) or `deadline` (the play clock
-reached 60% of the episode timeout first — the bench calls the ballot, the
-scripted tally vote stands in for any juror who has not voted, and the verdict,
-the reveal and the scores are produced normally).
+The episode ends `complete` (the ballot resolved normally and scores are
+published). If a seat fails to connect, times out, lacks LLM credentials, or
+produces an invalid action, the episode ends as an explicit policy failure
+(`COGAME_PLAYER_FAILURE_URI`) with no substitute move and no published scores.
 
 ## Layout
 
@@ -142,8 +144,8 @@ Or field a scripted baseline: same image, `--env PLAYER_SCRIPTED=tally` or
 
 An external policy registers over the player socket and receives its private
 role observation. It returns a complete action with the matching observation id.
-The game validates the action and uses the tally baseline if it is missing or
-invalid.
+The game validates the action and terminates the episode as a policy failure if
+it is missing, timed out, or invalid.
 
 ## Watching
 

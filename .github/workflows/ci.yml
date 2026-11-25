@@ -159,6 +159,15 @@ jobs:
             /tmp/tribunal-train-bridge
           python3 tools/test_prompt_games.py /tmp/tribunal-train-bridge
 
+      - name: Exercise native player policy and failure protocol
+        run: |
+          nim c --hints:off -d:release --path:src \
+            -o:/tmp/tribunal-game src/tribunal.nim
+          nim c --hints:off -d:release --path:src \
+            -o:/tmp/tribunal-player src/tribunal_player.nim
+          python3 tools/ci/player_policy_smoke.py /tmp/tribunal-game \
+            /tmp/tribunal-player
+
   # ---------------------------------------------------------------------
   # Packaging smoke: the production image builds, and one real episode runs
   # end to end in raw docker with the certification fixture's seat mix.

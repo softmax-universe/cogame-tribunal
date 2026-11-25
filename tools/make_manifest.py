@@ -31,13 +31,13 @@ DESCRIPTION = (
     "truth-tracking is the whole benchmark. Roles are a seeded permutation, so "
     "no policy can choose to be an advocate or a juror. The game is LLM-driven "
     "and a policy can be a prompt, external action policy, or scripted "
-    "baseline. Reuse the published player runnable with PLAYER_PROMPT for "
-    "Claude, or connect an external player to the general seat protocol. "
-    "Two scripted baselines "
+    "baseline. Reuse the published player runnable with PLAYER_PROMPT and "
+    "COWORLD_LLM_ENABLED=true for hosted LLM play, or connect an external "
+    "player to the general seat protocol. Two explicit scripted baselines "
     "(tally, which weighs the record's strengths, and hedge, which counts its "
-    "cards and holds evidence back) play any seat that registers as scripted, "
-    "and every seat when no LLM credentials are available, so episodes always "
-    "complete."
+    "cards and holds evidence back) play only seats that explicitly register "
+    "as scripted. Invalid, missing, or timed-out model/external actions "
+    "terminate the episode as a policy failure without awarding scores."
 )
 
 PLAYER_PROTOCOL = (
@@ -51,9 +51,11 @@ PLAYER_PROTOCOL = (
     '{"type":"observation","id":int,"observation":<seat-private state>} '
     "and returns "
     '{"type":"action","id":int,"action":<advocate, juror, or ballot action>}. '
-    "The game validates evidence ownership, argument and whisper lengths, "
-    "and sealed votes. It owns hidden information, rules, results, and replay. "
-    "Missing or invalid external actions use the tally baseline."
+    "The game validates evidence ownership, canonical lean/vote tokens, "
+    "argument and whisper lengths, and sealed votes. It owns hidden "
+    "information, rules, results, and replay. Missing, invalid, or timed-out "
+    "actions terminate the episode as an explicit policy failure with no "
+    "substitute move and no published scores."
 )
 
 GLOBAL_PROTOCOL = (
@@ -99,14 +101,15 @@ README = (
     "scores +1.0 for matching the hidden truth and -1.0 for missing it, "
     "individually, even when outvoted. Then the truth is revealed and the real "
     "culprit is named. A policy is just a prompt: field one by reusing the "
-    "published tribunal-player runnable with the PLAYER_PROMPT environment "
-    "variable set to your strategy - roles are dealt by the seed, so a good "
-    "prompt covers both. Two scripted baselines are always available "
+    "published tribunal-player runnable with COWORLD_LLM_ENABLED=true and "
+    "PLAYER_PROMPT set to your strategy - roles are dealt by the seed, so a "
+    "good prompt covers both. Two explicit scripted baselines are available "
     "(PLAYER_SCRIPTED=tally weighs the record's strengths and never introduces "
     "a card that hurts it; PLAYER_SCRIPTED=hedge counts cards instead of "
-    "weighing them and holds evidence back until the closing round), and they "
-    "play every seat when no LLM credentials are present, so episodes always "
-    "complete."
+    "weighing them and holds evidence back until the closing round). Model "
+    "seats never fall back to scripted actions: missing credentials, invalid "
+    "replies, or timeouts terminate the episode as a policy failure without "
+    "publishing scores."
 )
 
 RULES_MD = """# Tribunal rules
@@ -183,21 +186,22 @@ of evidence.
 
 ## Endings
 
-- `complete` - the ballot resolved normally.
-- `deadline` - the play deadline (60% of the episode timeout) arrived first.
-  The episode is **not** discarded: the bench calls the ballot immediately,
-  every juror who has not voted is given the scripted tally vote from the public
-  record, and the verdict, the reveal and the scores are produced normally.
+- `complete` - the ballot resolved normally and scores are published.
+- Policy failure - if any player fails to connect, times out, lacks LLM
+  credentials for a model seat, or produces an invalid or unparseable action,
+  the episode terminates as an explicit policy failure (`COGAME_PLAYER_FAILURE_URI`)
+  with no substitute action and no published scores.
 
 ## Fielding a policy
 
-A policy can be a prompt, external action policy, or scripted baseline. Reuse
-the published `tribunal-player` runnable and set `PLAYER_PROMPT` for Claude.
-External policies receive the role-specific private view and return complete
-actions over the player socket. Roles are dealt by the seed, so any operator
-prompt should cover both. `PLAYER_SCRIPTED=tally` and `PLAYER_SCRIPTED=hedge` field the two
-built-in baselines instead, which is also what every seat falls back to when a
-reply cannot be parsed or no LLM credentials exist.
+A policy can be a prompt, external action policy, or explicit scripted baseline.
+Reuse the published `tribunal-player` runnable with `COWORLD_LLM_ENABLED=true`,
+`COWORLD_LLM_MODEL`, and `PLAYER_PROMPT` for hosted LLM play. External policies
+receive the role-specific private view and return complete actions over the
+player socket. Roles are dealt by the seed, so any operator prompt should cover
+both. `PLAYER_SCRIPTED=tally` and `PLAYER_SCRIPTED=hedge` field the two
+built-in deterministic baselines as explicit choices; model seats never fall
+back to them.
 """
 
 SCORING_MD = """# Tribunal scoring
@@ -545,10 +549,15 @@ manifest = {
         player_entry(
             "tribunal-player",
             "Tribunal Prompt Player",
-            "The reference Tribunal policy: delivers its PLAYER_PROMPT (or a "
-            "default strategy covering both roles) to the game and spectates "
-            "until the final frame. Field your own policy by uploading this "
-            "same image with a different PLAYER_PROMPT.",
+            "The reference Tribunal model policy: enables the hosted LLM "
+            "sidecar (COWORLD_LLM_ENABLED=true) and delivers its "
+            "PLAYER_PROMPT (or a default strategy covering both roles) to the "
+            "game. Field your own policy by uploading this same image with a "
+            "different PLAYER_PROMPT.",
+            {
+                "COWORLD_LLM_ENABLED": "true",
+                "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5",
+            },
         ),
         player_entry(
             "tribunal-tally",

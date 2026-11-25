@@ -1,10 +1,8 @@
-## The scripted baselines must play whole episodes without ever proposing an
-## illegal action — they are both the no-credentials fallback (offline
-## certification) and fieldable policies, so this is the completion path. The
-## `tally` jury must also land inside the truth-tracking band: below the floor
-## the jury half of the benchmark is noise, above the ceiling it is trivial.
+## The explicit scripted baselines must play whole episodes without ever
+## proposing an illegal action. Model seats must NEVER fall back to a scripted
+## baseline when credentials are absent or replies are invalid.
 
-import std/[json, monotimes, sets, strutils, times, unicode, unittest]
+import std/[json, monotimes, os, sets, strutils, times, unicode, unittest]
 import tribunal/[llm, sim, prompts]
 
 proc fixture(seed: int, rounds = 4): GameConfig =
@@ -105,42 +103,60 @@ suite "scripted baselines":
     check rate >= 0.55
     check rate <= 0.85
 
-  test "decideAll falls back to scripted with no credentials":
+  test "decideAll fails loudly for model seats with no credentials and runs explicit scripted seats":
+    let prevEndpoint = getEnv("COWORLD_LLM_ENDPOINT")
+    let prevKey = getEnv("ANTHROPIC_API_KEY")
+    let prevUri = getEnv("ANTHROPIC_API_KEY_URI")
+    delEnv("COWORLD_LLM_ENDPOINT")
+    delEnv("ANTHROPIC_API_KEY")
+    delEnv("ANTHROPIC_API_KEY_URI")
+    defer:
+      if prevEndpoint.len > 0: putEnv("COWORLD_LLM_ENDPOINT", prevEndpoint)
+      if prevKey.len > 0: putEnv("ANTHROPIC_API_KEY", prevKey)
+      if prevUri.len > 0: putEnv("ANTHROPIC_API_KEY_URI", prevUri)
+
     let config = fixture(3, rounds = 2)
     let client = newLlmClient(config)
-    check client.disabled
+    check client.transport == ltNone
     var sim = initSim(config)
     let seats = sim.pendingSeats()
     check seats.len == Seats
+    ## A model seat with no credentials must raise PolicyDecisionError, never fall back.
+    expect PolicyDecisionError:
+      discard client.decideAll(sim, seats,
+        @["be bold", "", "", "", ""],
+        @[skNone, skTally, skHedge, skTally, skTally], PromptSelection())
+    ## All-scripted seats succeed deterministically with no credentials.
     let decisions = client.decideAll(sim, seats,
-      @["be bold", "", "", "", ""],
-      @[skNone, skNone, skHedge, skNone, skNone], PromptSelection())
+      @["", "", "", "", ""],
+      @[skTally, skTally, skHedge, skTally, skTally], PromptSelection())
     check decisions.len == Seats
-    ## Every decision comes from the SAME snapshot — the turn is simultaneous
-    ## — so the expectations are all computed before anything is applied.
-    var expected: seq[Decision]
-    for seat in seats:
-      expected.add(scriptedAction(sim, seat,
-        (if seat == 2: skHedge else: skTally)))
     for index, seat in seats:
-      check decisions[index].introduce == expected[index].introduce
-      check decisions[index].argument == expected[index].argument
-      check decisions[index].lean == expected[index].lean
-      ## A scripted decision says so, whether the seat was configured
-      ## scripted or fell back — the server stamps the event from this, so
-      ## the replay never calls a fallback an LLM decision.
       check decisions[index].scripted
-    check not parseAdvocateReply(%*{"argument": "my own words"}).scripted
-    for index, seat in seats:
       sim.applyDecision(seat, decisions[index], true)
     check sim.round == 1
-
+    check not parseAdvocateReply(%*{"argument": "my own words"}).scripted
 
 suite "reply parsing":
-  test "documented spellings are accepted and every field is capped":
+  test "strict canonical JSON and single-fence parsing rejects shims and aliases":
     var sim = initSim(fixture(4, rounds = 2))
     let prosecutor = sim.advocateSeat[0]
     let mine = sim.handOf(0)
+
+    ## Bare JSON and single outer Markdown fence are accepted.
+    check parseJsonObject("""{"vote": "guilty"}""")["vote"].getStr() == "guilty"
+    check parseJsonObject("```json\n{\"vote\": \"not_guilty\"}\n```")["vote"].getStr() == "not_guilty"
+    check parseJsonObject("```\n{\"vote\": \"guilty\"}\n```")["vote"].getStr() == "guilty"
+    ## Surrounding prose, unsupported fences, and multiple fences are rejected.
+    expect TribunalError:
+      discard parseJsonObject("""Here is my move: {"vote": "guilty"}""")
+    expect TribunalError:
+      discard parseJsonObject("```python\n{\"vote\": \"guilty\"}\n```")
+    expect TribunalError:
+      discard parseJsonObject("```json\n{\"vote\": \"guilty\"}\n```\nextra")
+    expect TribunalError:
+      discard parseJsonObject("```json\n{\"a\": 1}\n```\n```json\n{\"b\": 2}\n```")
+
     let advocate = parseAdvocateReply(parseJson(
       """{"introduce": ["e1", "E2", "E3"], "argument": "we begin\nhere",
           "notes": "keeping E9"}"""))
@@ -150,29 +166,34 @@ suite "reply parsing":
     check advocate.notes == "keeping E9"
     check parseAdvocateReply(parseJson(
       """{"argument": "no cards named"}""")).introduce.len == 0
+    ## Legacy bare-string introduce is rejected.
+    expect TribunalError:
+      discard parseAdvocateReply(parseJson("""{"introduce": "E1", "argument": "nope"}"""))
     expect TribunalError:
       discard parseAdvocateReply(parseJson("""{"introduce": ["E1"]}"""))
     expect TribunalError:
       discard parseAdvocateReply(parseJson("""{"argument": "   "}"""))
 
     let juror = parseJurorReply(parseJson(
-      """{"whisper": "8 to 5 for guilt", "lean": "Not Guilty"}"""))
+      """{"whisper": "8 to 5 for guilt", "lean": "not_guilty"}"""))
     check juror.whisper == "8 to 5 for guilt"
     check juror.lean == "not_guilty"
-    check parseJurorReply(parseJson("""{}""")).lean == "undecided"
-    check parseJurorReply(parseJson(
-      """{"lean": "sideways"}""")).lean == "undecided"
+    check parseJurorReply(parseJson("""{"lean": "undecided"}""")).lean == "undecided"
+    ## Missing, alias, or unrecognized leans are rejected (no silent undecided).
+    for badLean in ["""{}""", """{"lean": "sideways"}""", """{"lean": "Not Guilty"}""", """{"lean": "convict"}"""]:
+      expect TribunalError:
+        discard parseJurorReply(parseJson(badLean))
 
-    for spelling in ["guilty", "GUILTY", " g ", "convict"]:
-      check parseVoteReply(%*{"vote": spelling}).vote == "guilty"
-    for spelling in ["not_guilty", "not guilty", "NotGuilty", "innocent",
-        "acquit", "n"]:
-      check normalizeVote(spelling) == "not_guilty"
-    check normalizeVote("maybe") == ""
+    ## Only canonical vote tokens are accepted; obsolete aliases are rejected.
+    check parseVoteReply(%*{"vote": "guilty"}).vote == "guilty"
+    check parseVoteReply(%*{"vote": "not_guilty"}).vote == "not_guilty"
+    for alias in ["GUILTY", "g", "guilt", "convict", "not guilty", "NotGuilty",
+        "innocent", "acquit", "n", "maybe"]:
+      check normalizeVote(alias) == ""
+      expect TribunalError:
+        discard parseVoteReply(%*{"vote": alias})
     expect TribunalError:
       discard parseVoteReply(parseJson("""{"reason": "no vote"}"""))
-    expect TribunalError:
-      discard parseVoteReply(parseJson("""{"vote": "maybe"}"""))
 
     ## Caps, on rune boundaries.
     var long = ""
@@ -189,10 +210,13 @@ suite "reply parsing":
     check sim.record.len == 1
     check sim.record[0].card.id == mine[0].id
 
-    check parseScriptKind("1") == skTally
+    ## Only canonical scripted baseline names are accepted.
     check parseScriptKind("tally") == skTally
     check parseScriptKind("hedge") == skHedge
     check parseScriptKind("") == skNone
+    for legacy in ["1", "true", "yes", "TALLY", "other"]:
+      expect TribunalError:
+        discard parseScriptKind(legacy)
 
   test "prompts carry the seat's own view and nothing hidden":
     var sim = initSim(fixture(7, rounds = 3))
